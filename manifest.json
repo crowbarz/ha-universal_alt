@@ -1,0 +1,8 @@
+{
+  "domain": "universal_alt",
+  "name": "Combination of multiple media players into one for a universal controller",
+  "documentation": "https://home-assistant.io/components/media_player.universal/",
+  "dependencies": [],
+  "codeowners": [],
+  "requirements": []
+}
