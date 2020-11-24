@@ -1,15 +1,10 @@
-"""
-Combination of multiple media players into one for a universal controller.
-
-For more details about this platform, please refer to the documentation at
-https://home-assistant.io/components/media_player.universal/
-"""
+"""Combination of multiple media players for a universal controller."""
 from copy import copy
 import logging
 
 import voluptuous as vol
 
-from homeassistant.components.media_player import PLATFORM_SCHEMA, MediaPlayerDevice
+from homeassistant.components.media_player import PLATFORM_SCHEMA, MediaPlayerEntity
 from homeassistant.components.media_player.const import (
     ATTR_APP_ID,
     ATTR_APP_NAME,
@@ -80,8 +75,11 @@ from homeassistant.const import (
     STATE_ON,
     STATE_UNAVAILABLE,
 )
-from homeassistant.core import callback
+from homeassistant.core import EVENT_HOMEASSISTANT_START, callback
+from homeassistant.exceptions import TemplateError
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.event import TrackTemplate, async_track_template_result
+from homeassistant.helpers.reload import async_setup_reload_service
 from homeassistant.helpers.service import async_call_from_config
 from homeassistant.exceptions import TemplateError
 
@@ -118,9 +116,38 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
     extra=vol.REMOVE_EXTRA,
 )
 
+## Attributes excluded from state_attr
+EXCLUDED_ATTRS = [
+    ATTR_MEDIA_VOLUME_LEVEL,
+    ATTR_MEDIA_VOLUME_MUTED,
+    ATTR_MEDIA_CONTENT_ID,
+    ATTR_MEDIA_CONTENT_TYPE,
+    ATTR_MEDIA_DURATION,
+    ATTR_ENTITY_PICTURE,
+    ATTR_MEDIA_TITLE,
+    ATTR_MEDIA_ARTIST,
+    ATTR_MEDIA_ALBUM_NAME,
+    ATTR_MEDIA_ALBUM_ARTIST,
+    ATTR_MEDIA_TRACK,
+    ATTR_MEDIA_SERIES_TITLE,
+    ATTR_MEDIA_SEASON,
+    ATTR_MEDIA_EPISODE,
+    ATTR_MEDIA_CHANNEL,
+    ATTR_MEDIA_PLAYLIST,
+    ATTR_APP_ID,
+    ATTR_APP_NAME,
+    ATTR_INPUT_SOURCE,
+    ATTR_INPUT_SOURCE_LIST,
+    ATTR_MEDIA_SHUFFLE,
+    ATTR_MEDIA_POSITION,
+    ATTR_MEDIA_POSITION_UPDATED_AT,
+]
 
 async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
     """Set up the universal media players."""
+
+    await async_setup_reload_service(hass, "universal", ["media_player"])
+
     player = UniversalMediaPlayer(
         hass,
         config.get(CONF_NAME),
@@ -128,16 +155,16 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
         config.get(CONF_COMMANDS),
         config.get(CONF_ATTRS),
         config.get(CONF_ATTRS_TEMPLATE),
-        config.get(CONF_STATE_TEMPLATE)
+        config.get(CONF_STATE_TEMPLATE),
     )
 
     async_add_entities([player])
 
 
-class UniversalMediaPlayer(MediaPlayerDevice):
+class UniversalMediaPlayer(MediaPlayerEntity):
     """Representation of an universal media player."""
 
-    def __init__(self, hass, name, children, commands, attributes, attrs_template, state_template=None):
+    def __init__(self, hass, name, children, commands, attributes, attrs_templates, state_template=None):
         """Initialize the Universal media device."""
         self.hass = hass
         self._name = name
@@ -150,34 +177,96 @@ class UniversalMediaPlayer(MediaPlayerDevice):
                 attr.append(None)
             self._attrs[key] = attr
         self._child_state = None
-        self._attrs_template = attrs_template
-        for template in self._attrs_template.values():
-            template.hass = hass
+        self._state_template_result = None
         self._state_template = state_template
-        if state_template is not None:
-            self._state_template.hass = hass
+        self._attrs_templates = attrs_templates
+        self._attrs_template_results = { attr: None for attr in attrs_templates.keys() }
 
     async def async_added_to_hass(self):
         """Subscribe to children and template state changes."""
 
         @callback
-        def async_on_dependency_update(*_):
+        def _async_on_dependency_update(event):
             """Update ha state when dependencies update."""
+            self.async_set_context(event.context)
             self.async_schedule_update_ha_state(True)
+
+        @callback
+        def _async_on_template_update(event, updates):
+            """Update ha state when dependencies update."""
+            result = updates.pop().result
+
+            if isinstance(result, TemplateError):
+                self._state_template_result = None
+            else:
+                self._state_template_result = result
+
+            if event:
+                self.async_set_context(event.context)
+
+            self.async_schedule_update_ha_state(True)
+
+        def _find_attr_template(find_template):
+            """Find attr given template."""
+            for attr, template in self._attrs_templates.items():
+                if template is find_template:
+                    return attr
+            return None
+
+        @callback
+        def _async_on_attr_template_update(event, updates):
+            """Update ha state when attribute template dependencies update."""
+            for update in updates:
+                template = update.template
+                result = update.result
+                attr = _find_attr_template(template)
+                if attr is None:
+                    _LOGGER.error("could not find template for attribute %s", attr)
+                    continue
+
+                if isinstance(result, TemplateError):
+                    _LOGGER.warning("template render failed for %s.%s: %s", self._name, attr, result)
+                    self._attrs_template_results[attr] = None
+                else:
+                    self._attrs_template_results[attr] = result
+
+            if event:
+                self.async_set_context(event.context)
+
+            self.async_schedule_update_ha_state(True)
+
+        if self._state_template is not None:
+            result = async_track_template_result(
+                self.hass,
+                [TrackTemplate(self._state_template, None)],
+                _async_on_template_update,
+            )
+            self.hass.bus.async_listen_once(
+                EVENT_HOMEASSISTANT_START, callback(lambda _: result.async_refresh())
+            )
+
+            self.async_on_remove(result.async_remove)
+
+        if self._attrs_templates:
+            result = async_track_template_result(
+                self.hass,
+                [TrackTemplate(template, None) for template in self._attrs_templates.values()],
+                _async_on_attr_template_update,
+            )
+            self.hass.bus.async_listen_once(
+                EVENT_HOMEASSISTANT_START, callback(lambda _: result.async_refresh())
+            )
+
+            self.async_on_remove(result.async_remove)
 
         depend = copy(self._children)
         for entity in self._attrs.values():
             depend.append(entity[0])
-        if self._attrs_template:
-            for template in self._attrs_template.values():
-                for entity in template.extract_entities():
-                    depend.append(entity)
-        if self._state_template is not None:
-            for entity in self._state_template.extract_entities():
-                depend.append(entity)
 
-        self.hass.helpers.event.async_track_state_change(
-            list(set(depend)), async_on_dependency_update
+        self.async_on_remove(
+            self.hass.helpers.event.async_track_state_change_event(
+                list(set(depend)), _async_on_dependency_update
+            )
         )
 
     def _entity_lkp(self, entity_id, state_attr=None):
@@ -193,14 +282,10 @@ class UniversalMediaPlayer(MediaPlayerDevice):
 
     def _override_or_child_attr(self, attr_name):
         """Return either the override or the active child for attr_name."""
-        if attr_name in self._attrs_template:
-            try:
-                attr_value =  self._attrs_template[attr_name].async_render()
-                return attr_value if attr_value != "None" else None
-            except TemplateError as ex:
-                _LOGGER.warning("Template render failed for %s.%s: %s", self._name, attr_name, ex)
-                return None
-                
+        if attr_name in self._attrs_templates:
+            attr_value = self._attrs_template_results[attr_name]
+            return attr_value if attr_value != "None" else None
+
         elif attr_name in self._attrs:
             return self._entity_lkp(
                 self._attrs[attr_name][0], self._attrs[attr_name][1]
@@ -238,7 +323,7 @@ class UniversalMediaPlayer(MediaPlayerDevice):
         service_data[ATTR_ENTITY_ID] = active_child.entity_id
 
         await self.hass.services.async_call(
-            DOMAIN, service_name, service_data, blocking=True
+            DOMAIN, service_name, service_data, blocking=True, context=self._context
         )
 
     @property
@@ -250,7 +335,7 @@ class UniversalMediaPlayer(MediaPlayerDevice):
     def master_state(self):
         """Return the master state for entity or None."""
         if self._state_template is not None:
-            return self._state_template.async_render()
+            return self._state_template_result
         if CONF_STATE in self._attrs:
             master_state = self._entity_lkp(
                 self._attrs[CONF_STATE][0], self._attrs[CONF_STATE][1]
@@ -458,8 +543,17 @@ class UniversalMediaPlayer(MediaPlayerDevice):
     @property
     def device_state_attributes(self):
         """Return device specific state attributes."""
+
+        def _without_keys(d, keys):
+            """Return dict excluding specified keys."""
+            return {k: v for k, v in d.items() if v and k not in keys }
+
         active_child = self._child_state
-        return {ATTR_ACTIVE_CHILD: active_child.entity_id} if active_child else {}
+        state_attr = _without_keys(self._attrs_template_results, EXCLUDED_ATTRS)
+        if active_child:
+            state_attr[ATTR_ACTIVE_CHILD] = active_child.entity_id
+
+        return state_attr
 
     @property
     def media_position(self):
