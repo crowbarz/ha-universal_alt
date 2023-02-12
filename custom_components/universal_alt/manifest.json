@@ -1,7 +1,9 @@
 {
   "domain": "universal_alt",
-  "name": "Universal Media Player",
-  "documentation": "https://www.home-assistant.io/integrations/universal",
+  "name": "Universal Media Player (alternative)",
+  "version": "2023.2.3-p0.1.0",
   "codeowners": [],
+  "documentation": "https://www.home-assistant.io/integrations/universal",
+  "iot_class": "calculated",
   "quality_scale": "internal"
 }
