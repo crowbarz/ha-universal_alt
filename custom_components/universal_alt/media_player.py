@@ -1,4 +1,5 @@
 """Combination of multiple media players for a universal controller."""
+
 from __future__ import annotations
 
 from copy import copy
@@ -41,12 +42,15 @@ from homeassistant.components.media_player import (
     SERVICE_PLAY_MEDIA,
     SERVICE_SELECT_SOUND_MODE,
     SERVICE_SELECT_SOURCE,
-    MediaPlayerDeviceClass,
     MediaPlayerEntity,
     MediaPlayerEntityFeature,
     MediaPlayerState,
+    MediaType,
+    RepeatMode,
 )
+from homeassistant.components.media_player.browse_media import BrowseMedia
 from homeassistant.const import (
+    ATTR_ASSUMED_STATE,
     ATTR_ENTITY_ID,
     ATTR_ENTITY_PICTURE,
     ATTR_SUPPORTED_FEATURES,
@@ -76,12 +80,14 @@ from homeassistant.const import (
     STATE_UNAVAILABLE,
     STATE_UNKNOWN,
 )
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import Event, EventStateChangedData, HomeAssistant, callback
 from homeassistant.exceptions import TemplateError
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.entity_component import EntityComponent
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import (
     TrackTemplate,
+    TrackTemplateResult,
     async_track_state_change_event,
     async_track_template_result,
 )
@@ -93,10 +99,12 @@ _LOGGER = logging.getLogger(__name__)
 
 ATTR_ACTIVE_CHILD = "active_child"
 
+CONF_ACTIVE_CHILD_TEMPLATE = "active_child_template"
 CONF_ATTRS = "attributes"
 CONF_ATTRS_TEMPLATE = "attributes_template"
 CONF_CHILDREN = "children"
 CONF_COMMANDS = "commands"
+CONF_BROWSE_MEDIA_ENTITY = "browse_media_entity"
 
 STATES_ORDER = [
     STATE_UNKNOWN,
@@ -124,8 +132,10 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
         vol.Optional(CONF_ATTRS, default={}): vol.Or(
             cv.ensure_list(ATTRS_SCHEMA), ATTRS_SCHEMA
         ),
+        vol.Optional(CONF_BROWSE_MEDIA_ENTITY): cv.string,
         vol.Optional(CONF_UNIQUE_ID): cv.string,
         vol.Optional(CONF_DEVICE_CLASS): DEVICE_CLASSES_SCHEMA,
+        vol.Optional(CONF_ACTIVE_CHILD_TEMPLATE): cv.template,
         vol.Optional(CONF_ATTRS_TEMPLATE, default={}): vol.Or(
             cv.ensure_list(ATTRS_TEMPLATE_SCHEMA), ATTRS_TEMPLATE_SCHEMA
         ),
@@ -171,18 +181,7 @@ async def async_setup_platform(
     """Set up the universal media players."""
     await async_setup_reload_service(hass, "universal", ["media_player"])
 
-    player = UniversalMediaPlayer(
-        hass,
-        config.get(CONF_NAME),
-        config.get(CONF_CHILDREN),
-        config.get(CONF_COMMANDS),
-        config.get(CONF_ATTRS),
-        config.get(CONF_UNIQUE_ID),
-        config.get(CONF_DEVICE_CLASS),
-        config.get(CONF_ATTRS_TEMPLATE),
-        config.get(CONF_STATE_TEMPLATE),
-    )
-
+    player = UniversalMediaPlayer(hass, config)
     async_add_entities([player])
 
 
@@ -194,69 +193,63 @@ class UniversalMediaPlayer(MediaPlayerEntity):
     def __init__(
         self,
         hass,
-        name,
-        children,
-        commands,
-        attributes,
-        unique_id=None,
-        device_class=None,
-        attrs_templates=None,
-        state_template=None,
+        config,
     ):
         """Initialize the Universal media device."""
-        _LOGGER.info("UniversalMediaPlayer(%s).__init__", name)
+        _LOGGER.info("UniversalMediaPlayer(%s).__init__", config.get(CONF_NAME))
 
         self.hass = hass
-        self._name = name
-        self._children = children
-        self._cmds = commands
+        self._name = config.get(CONF_NAME)
+        self._children = config.get(CONF_CHILDREN)
+        self._active_child_template = config.get(CONF_ACTIVE_CHILD_TEMPLATE)
+        self._active_child_template_result = None
+        self._cmds = config.get(CONF_COMMANDS)
         self._attrs = {}
-        for key, val in attributes.items():
+        for key, val in config.get(CONF_ATTRS).items():
             attr = list(map(str.strip, val.split("|", 1)))
             if len(attr) == 1:
                 attr.append(None)
             self._attrs[key] = attr
         self._child_state = None
         self._state_template_result = None
-        self._state_template = state_template
-        self._state_template_tracker = None
-        self._device_class = device_class
-        self._attr_unique_id = unique_id
-        self._attrs_templates = attrs_templates
-        self._attrs_template_results = {attr: None for attr in attrs_templates.keys()}
-        self._attrs_template_tracker = None
+        self._state_template = config.get(CONF_STATE_TEMPLATE)
+        self._attr_device_class = config.get(CONF_DEVICE_CLASS)
+        self._attr_unique_id = config.get(CONF_UNIQUE_ID)
+        self._browse_media_entity = config.get(CONF_BROWSE_MEDIA_ENTITY)
+        self._attrs_templates = config.get(CONF_ATTRS_TEMPLATE)
+        self._attrs_template_results = {
+            attr: None for attr in self._attrs_templates.keys()
+        }
 
     async def async_added_to_hass(self) -> None:
         """Subscribe to children and template state changes."""
 
         @callback
-        def _async_on_dependency_update(event):
+        def _async_on_dependency_update(
+            event: Event[EventStateChangedData],
+        ) -> None:
             """Update ha state when dependencies update."""
             self.async_set_context(event.context)
             self.async_schedule_update_ha_state(True)
 
         @callback
-        def _async_on_template_update(event, updates):
-            """Update ha state when dependencies update."""
-            result = updates.pop().result
+        def _async_on_template_update(
+            event: Event[EventStateChangedData] | None,
+            updates: list[TrackTemplateResult],
+        ) -> None:
+            """Update state when template state changes."""
+            for data in updates:
+                template = data.template
+                result = data.result
 
-            if isinstance(result, TemplateError):
-                _LOGGER.warning(
-                    "state template render failed for %s: %s", self._name, result
-                )
-                self._state_template_result = None
-            else:
-                self._state_template_result = result
-
-            if len(updates):
-                _LOGGER.warning(
-                    "%d additional updates ignored for %s: %s",
-                    len(updates),
-                    self._name,
-                    [update.result for update in updates],
-                )
-            else:
-                _LOGGER.debug("updated state for %s to: %s", self._name, result)
+                if template == self._state_template:
+                    self._state_template_result = (
+                        None if isinstance(result, TemplateError) else result
+                    )
+                if template == self._active_child_template:
+                    self._active_child_template_result = (
+                        None if isinstance(result, TemplateError) else result
+                    )
 
             if event:
                 self.async_set_context(event.context)
@@ -271,8 +264,11 @@ class UniversalMediaPlayer(MediaPlayerEntity):
             return None
 
         @callback
-        def _async_on_attr_template_update(event, updates):
-            """Update ha state when attribute template dependencies update."""
+        def _async_on_attr_template_update(
+            event: Event[EventStateChangedData] | None,
+            updates: list[TrackTemplateResult],
+        ) -> None:
+            """Update ha state when attribute template state changes."""
             for update in updates:
                 template = update.template
                 result = update.result
@@ -297,10 +293,16 @@ class UniversalMediaPlayer(MediaPlayerEntity):
 
             self.async_schedule_update_ha_state(True)
 
-        if self._state_template is not None:
+        track_templates: list[TrackTemplate] = []
+        if self._state_template:
+            track_templates.append(TrackTemplate(self._state_template, None))
+        if self._active_child_template:
+            track_templates.append(TrackTemplate(self._active_child_template, None))
+
+        if track_templates:
             result = async_track_template_result(
                 self.hass,
-                [TrackTemplate(self._state_template, None)],
+                track_templates,
                 _async_on_template_update,
             )
             self.hass.bus.async_listen_once(
@@ -308,15 +310,15 @@ class UniversalMediaPlayer(MediaPlayerEntity):
             )
 
             self.async_on_remove(result.async_remove)
-            self._state_template_tracker = result
 
         if self._attrs_templates:
+            track_attr_templates: list[TrackTemplate] = [
+                TrackTemplate(template, None)
+                for template in self._attrs_templates.values()
+            ]
             result = async_track_template_result(
                 self.hass,
-                [
-                    TrackTemplate(template, None)
-                    for template in self._attrs_templates.values()
-                ],
+                track_attr_templates,
                 _async_on_attr_template_update,
             )
             self.hass.bus.async_listen_once(
@@ -324,7 +326,6 @@ class UniversalMediaPlayer(MediaPlayerEntity):
             )
 
             self.async_on_remove(result.async_remove)
-            self._attrs_template_tracker = result
 
         depend = copy(self._children)
         for entity in self._attrs.values():
@@ -391,11 +392,6 @@ class UniversalMediaPlayer(MediaPlayerEntity):
         )
 
     @property
-    def device_class(self) -> MediaPlayerDeviceClass | None:
-        """Return the class of this device."""
-        return self._device_class
-
-    @property
     def master_state(self):
         """Return the master state for entity or None."""
         if self._state_template is not None:
@@ -416,6 +412,11 @@ class UniversalMediaPlayer(MediaPlayerEntity):
         return self._name
 
     @property
+    def assumed_state(self) -> bool:
+        """Return True if unable to access real state of the entity."""
+        return self._child_attr(ATTR_ASSUMED_STATE)
+
+    @property
     def state(self):
         """Return the current state of media player.
 
@@ -428,8 +429,7 @@ class UniversalMediaPlayer(MediaPlayerEntity):
             _LOGGER.debug("state = template state(%s)", master_state)
             return master_state
 
-        active_child = self._child_state
-        if active_child:
+        if active_child := self._child_state:
             return active_child.state
 
         _LOGGER.debug(
@@ -473,8 +473,7 @@ class UniversalMediaPlayer(MediaPlayerEntity):
 
     @property
     def entity_picture(self):
-        """
-        Return image of the media playing.
+        """Return image of the media playing.
 
         The universal media player doesn't use the parent class logic, since
         the url is coming from child entity pictures which have already been
@@ -602,8 +601,7 @@ class UniversalMediaPlayer(MediaPlayerEntity):
 
         if any(cmd in self._cmds for cmd in (SERVICE_VOLUME_UP, SERVICE_VOLUME_DOWN)):
             flags |= MediaPlayerEntityFeature.VOLUME_STEP
-            flags &= ~MediaPlayerEntityFeature.VOLUME_SET
-        elif SERVICE_VOLUME_SET in self._cmds:
+        if SERVICE_VOLUME_SET in self._cmds:
             flags |= MediaPlayerEntityFeature.VOLUME_SET
 
         if SERVICE_VOLUME_MUTE in self._cmds and ATTR_MEDIA_VOLUME_MUTED in self._attrs:
@@ -642,6 +640,9 @@ class UniversalMediaPlayer(MediaPlayerEntity):
 
         if SERVICE_PLAY_MEDIA in self._cmds:
             flags |= MediaPlayerEntityFeature.PLAY_MEDIA
+
+        if self._browse_media_entity:
+            flags |= MediaPlayerEntityFeature.BROWSE_MEDIA
 
         if SERVICE_CLEAR_PLAYLIST in self._cmds:
             flags |= MediaPlayerEntityFeature.CLEAR_PLAYLIST
@@ -731,7 +732,7 @@ class UniversalMediaPlayer(MediaPlayerEntity):
         await self._async_call_service(SERVICE_MEDIA_SEEK, data, allow_override=True)
 
     async def async_play_media(
-        self, media_type: str, media_id: str, **kwargs: Any
+        self, media_type: MediaType | str, media_id: str, **kwargs: Any
     ) -> None:
         """Play a piece of media."""
         data = {ATTR_MEDIA_CONTENT_TYPE: media_type, ATTR_MEDIA_CONTENT_ID: media_id}
@@ -770,7 +771,7 @@ class UniversalMediaPlayer(MediaPlayerEntity):
         data = {ATTR_MEDIA_SHUFFLE: shuffle}
         await self._async_call_service(SERVICE_SHUFFLE_SET, data, allow_override=True)
 
-    async def async_set_repeat(self, repeat: str) -> None:
+    async def async_set_repeat(self, repeat: RepeatMode) -> None:
         """Set repeat mode."""
         data = {ATTR_MEDIA_REPEAT: repeat}
         await self._async_call_service(SERVICE_REPEAT_SET, data, allow_override=True)
@@ -783,12 +784,25 @@ class UniversalMediaPlayer(MediaPlayerEntity):
             # Delegate to turn_on or turn_off by default
             await super().async_toggle()
 
+    async def async_browse_media(
+        self,
+        media_content_type: MediaType | str | None = None,
+        media_content_id: str | None = None,
+    ) -> BrowseMedia:
+        """Return a BrowseMedia instance."""
+        entity_id = self._browse_media_entity
+        if not entity_id and self._child_state:
+            entity_id = self._child_state.entity_id
+        component: EntityComponent[MediaPlayerEntity] = self.hass.data[DOMAIN]
+        if entity_id and (entity := component.get_entity(entity_id)):
+            return await entity.async_browse_media(media_content_type, media_content_id)
+        raise NotImplementedError
+
     async def async_update(self) -> None:
         """Update state in HA."""
-        # Refresh templates
-        if self._state_template_tracker:
-            self._state_template_tracker.async_refresh()
-
+        if self._active_child_template_result:
+            self._child_state = self.hass.states.get(self._active_child_template_result)
+            return
         self._child_state = None
         for child_name in self._children:
             if (child_state := self.hass.states.get(child_name)) and (
