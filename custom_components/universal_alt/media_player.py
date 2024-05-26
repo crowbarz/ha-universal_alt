@@ -216,7 +216,7 @@ class UniversalMediaPlayer(MediaPlayerEntity):
         self._attr_device_class = config.get(CONF_DEVICE_CLASS)
         self._attr_unique_id = config.get(CONF_UNIQUE_ID)
         self._browse_media_entity = config.get(CONF_BROWSE_MEDIA_ENTITY)
-        self._attrs_templates = config.get(CONF_ATTRS_TEMPLATE)
+        self._attrs_templates: dict[str, str] = config.get(CONF_ATTRS_TEMPLATE)
         self._attrs_template_results = {
             attr: None for attr in self._attrs_templates.keys()
         }
@@ -231,6 +231,13 @@ class UniversalMediaPlayer(MediaPlayerEntity):
             """Update ha state when dependencies update."""
             self.async_set_context(event.context)
             self.async_schedule_update_ha_state(True)
+
+        def _find_attr_template(find_template):
+            """Find attr given template."""
+            for attr, template in self._attrs_templates.items():
+                if template is find_template:
+                    return attr
+            return None
 
         @callback
         def _async_on_template_update(
@@ -250,43 +257,10 @@ class UniversalMediaPlayer(MediaPlayerEntity):
                     self._active_child_template_result = (
                         None if isinstance(result, TemplateError) else result
                     )
-
-            if event:
-                self.async_set_context(event.context)
-
-            self.async_schedule_update_ha_state(True)
-
-        def _find_attr_template(find_template):
-            """Find attr given template."""
-            for attr, template in self._attrs_templates.items():
-                if template is find_template:
-                    return attr
-            return None
-
-        @callback
-        def _async_on_attr_template_update(
-            event: Event[EventStateChangedData] | None,
-            updates: list[TrackTemplateResult],
-        ) -> None:
-            """Update ha state when attribute template state changes."""
-            for update in updates:
-                template = update.template
-                result = update.result
-                attr = _find_attr_template(template)
-                if attr is None:
-                    _LOGGER.error("could not find template for attribute %s", attr)
-                    continue
-
-                if isinstance(result, TemplateError):
-                    _LOGGER.warning(
-                        "attr template render failed for %s.%s: %s",
-                        self._name,
-                        attr,
-                        result,
+                if (attr := _find_attr_template(template)) is not None:
+                    self._attrs_template_results[attr] = (
+                        None if isinstance(result, TemplateError) else result
                     )
-                    self._attrs_template_results[attr] = None
-                else:
-                    self._attrs_template_results[attr] = result
 
             if event:
                 self.async_set_context(event.context)
@@ -298,28 +272,19 @@ class UniversalMediaPlayer(MediaPlayerEntity):
             track_templates.append(TrackTemplate(self._state_template, None))
         if self._active_child_template:
             track_templates.append(TrackTemplate(self._active_child_template, None))
+        if self._attrs_templates:
+            track_templates.extend(
+                [
+                    TrackTemplate(template, None)
+                    for template in self._attrs_templates.values()
+                ]
+            )
 
         if track_templates:
             result = async_track_template_result(
                 self.hass,
                 track_templates,
                 _async_on_template_update,
-            )
-            self.hass.bus.async_listen_once(
-                EVENT_HOMEASSISTANT_START, callback(lambda _: result.async_refresh())
-            )
-
-            self.async_on_remove(result.async_remove)
-
-        if self._attrs_templates:
-            track_attr_templates: list[TrackTemplate] = [
-                TrackTemplate(template, None)
-                for template in self._attrs_templates.values()
-            ]
-            result = async_track_template_result(
-                self.hass,
-                track_attr_templates,
-                _async_on_attr_template_update,
             )
             self.hass.bus.async_listen_once(
                 EVENT_HOMEASSISTANT_START, callback(lambda _: result.async_refresh())
@@ -607,31 +572,6 @@ class UniversalMediaPlayer(MediaPlayerEntity):
         if SERVICE_VOLUME_MUTE in self._cmds and ATTR_MEDIA_VOLUME_MUTED in self._attrs:
             flags |= MediaPlayerEntityFeature.VOLUME_MUTE
 
-        if (SERVICE_MEDIA_PLAY in self._cmds) or (
-            SERVICE_MEDIA_PLAY_PAUSE in self._cmds
-        ):
-            flags |= MediaPlayerEntityFeature.PLAY
-
-        if (SERVICE_MEDIA_PAUSE in self._cmds) or (
-            SERVICE_MEDIA_PLAY_PAUSE in self._cmds
-        ):
-            flags |= MediaPlayerEntityFeature.PAUSE
-
-        if SERVICE_MEDIA_STOP in self._cmds:
-            flags |= MediaPlayerEntityFeature.STOP
-
-        if SERVICE_MEDIA_PREVIOUS_TRACK in self._cmds:
-            flags |= MediaPlayerEntityFeature.PREVIOUS_TRACK
-
-        if SERVICE_MEDIA_NEXT_TRACK in self._cmds:
-            flags |= MediaPlayerEntityFeature.NEXT_TRACK
-
-        if SERVICE_MEDIA_SEEK in self._cmds:
-            flags |= MediaPlayerEntityFeature.SEEK
-
-        if SERVICE_PLAY_MEDIA in self._cmds:
-            flags |= MediaPlayerEntityFeature.PLAY_MEDIA
-
         if (
             SERVICE_SELECT_SOURCE in self._cmds
             and ATTR_INPUT_SOURCE_LIST in self._attrs
@@ -667,7 +607,7 @@ class UniversalMediaPlayer(MediaPlayerEntity):
 
         def _without_keys(sdt, keys):
             """Return dict excluding specified keys."""
-            return {k: v for k, v in sdt.items() if v and k not in keys}
+            return {k: v for k, v in sdt.items() if v is not None and k not in keys}
 
         active_child = self._child_state
         state_attr = _without_keys(self._attrs_template_results, EXCLUDED_ATTRS)
